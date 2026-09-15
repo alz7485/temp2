@@ -1,0 +1,18 @@
+import unicodedata
+NORMALIZATION_VERSION = 1
+
+def normalize_search_text(text):
+    return unicodedata.normalize("NFKC", "" if text is None else str(text)).casefold()
+
+def repair_skype_utf8_text(text):
+    text = "" if text is None else str(text)
+    if not text: return ""
+    try: return text.encode("cp932").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError): return text
+
+def is_conversation_history_folder(folder_name):
+    return str(folder_name or "").strip().casefold() == "会話履歴".casefold()
+
+def prepare_outlook_text(text, folder_name=""):
+    text = "" if text is None else str(text)
+    return repair_skype_utf8_text(text) if is_conversation_history_folder(folder_name) else text
