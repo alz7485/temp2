@@ -1,0 +1,2467 @@
+from copy import deepcopy
+
+from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtGui import QColor, QBrush, QCloseEvent
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from db_manager import DatabaseManager
+from mail_builder import MailBuilder, BuildCancelled
+from outlook_scanner import OutlookScanner, ScanCancelled
+from logger import log_exception, log_info
+
+
+# ============================================================
+# Tree data roles
+# ============================================================
+
+ROLE_NODE = Qt.UserRole
+ROLE_STORE_ID = Qt.UserRole + 1
+ROLE_FOLDER_ID = Qt.UserRole + 2
+
+
+# ============================================================
+# Scan Worker
+# ============================================================
+
+class ScanWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+    progress = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
+
+    def _is_cancelled(self):
+        return self._cancel_requested
+
+    def run(self):
+        try:
+            scanner = OutlookScanner(
+                cancel_callback=self._is_cancelled,
+                progress_callback=self.progress.emit,
+            )
+
+            stores = scanner.scan()
+
+            if self._cancel_requested:
+                self.cancelled.emit()
+                return
+
+            self.finished.emit(stores)
+
+        except ScanCancelled:
+            self.cancelled.emit()
+
+        except Exception as exc:
+            log_exception(
+                "Outlook folder scan failed"
+            )
+
+            self.failed.emit(
+                str(exc)
+            )
+
+
+# ============================================================
+# Full Build Worker
+# ============================================================
+
+class FullBuildWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+    progress = Signal(object)
+
+    def __init__(
+        self,
+        db_manager,
+        folders,
+    ):
+        super().__init__()
+
+        self.db_manager = db_manager
+        self.folders = folders
+
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
+
+    def _is_cancelled(self):
+        return self._cancel_requested
+
+    def run(self):
+        try:
+            builder = MailBuilder(
+                db_manager=self.db_manager,
+                folders=self.folders,
+                cancel_callback=self._is_cancelled,
+                progress_callback=self.progress.emit,
+            )
+
+            result = builder.build()
+
+            if self._cancel_requested:
+                self.cancelled.emit()
+                return
+
+            self.finished.emit(result)
+
+        except BuildCancelled:
+            self.cancelled.emit()
+
+        except Exception as exc:
+            log_exception(
+                "Full build worker failed"
+            )
+
+            self.failed.emit(
+                str(exc)
+            )
+
+
+# ============================================================
+# Main Window
+# ============================================================
+
+class MainWindow(QMainWindow):
+    def __init__(
+        self,
+        settings_manager,
+    ):
+        super().__init__()
+
+        self.settings_manager = (
+            settings_manager
+        )
+
+        self.db_manager = (
+            DatabaseManager(
+                settings_manager.base_dir
+            )
+        )
+
+        self.stores = []
+
+        # ----------------------------------------------------
+        # Scan state
+        # ----------------------------------------------------
+
+        self.scan_thread = None
+        self.scan_worker = None
+
+        # ----------------------------------------------------
+        # Build state
+        # ----------------------------------------------------
+
+        self.build_thread = None
+        self.build_worker = None
+
+        self._build_result = None
+        self._build_error = None
+        self._build_was_cancelled = False
+
+        # ----------------------------------------------------
+        # Common state
+        # ----------------------------------------------------
+
+        self.operation_type = None
+
+        self.dirty = False
+
+        self._updating_tree = False
+
+        self._close_requested = False
+
+        self.setWindowTitle(
+            "Outlook DB Builder - 設定"
+        )
+
+        self.resize(
+            900,
+            700,
+        )
+
+        self._build_ui()
+        self._load_initial_settings()
+        self._refresh_db_status()
+
+    # ========================================================
+    # UI
+    # ========================================================
+
+    def _build_ui(self):
+        central = QWidget(self)
+
+        self.setCentralWidget(
+            central
+        )
+
+        root_layout = QVBoxLayout(
+            central
+        )
+
+        # ----------------------------------------------------
+        # Header
+        # ----------------------------------------------------
+
+        header_layout = QHBoxLayout()
+
+        title_label = QLabel(
+            "Outlookフォルダ"
+        )
+
+        title_label.setStyleSheet(
+            "font-weight: bold;"
+        )
+
+        header_layout.addWidget(
+            title_label
+        )
+
+        header_layout.addStretch()
+
+        self.rescan_button = QPushButton(
+            "Outlookを再解析"
+        )
+
+        self.rescan_button.clicked.connect(
+            self._start_scan
+        )
+
+        header_layout.addWidget(
+            self.rescan_button
+        )
+
+        root_layout.addLayout(
+            header_layout
+        )
+
+        # ----------------------------------------------------
+        # Description
+        # ----------------------------------------------------
+
+        description = QLabel(
+            "検索DBへ登録するフォルダを"
+            "選択してください。\n"
+            "親フォルダをOFFにすると"
+            "子フォルダのチェック状態は保持したまま"
+            "一時的に無効になります。"
+        )
+
+        description.setWordWrap(
+            True
+        )
+
+        root_layout.addWidget(
+            description
+        )
+
+        # ----------------------------------------------------
+        # Tree
+        # ----------------------------------------------------
+
+        self.tree = QTreeWidget()
+
+        self.tree.setHeaderLabels(
+            [
+                "フォルダ",
+                "状態",
+            ]
+        )
+
+        self.tree.setColumnWidth(
+            0,
+            650,
+        )
+
+        self.tree.itemChanged.connect(
+            self._on_tree_item_changed
+        )
+
+        root_layout.addWidget(
+            self.tree,
+            1,
+        )
+
+        # ----------------------------------------------------
+        # DB status
+        # ----------------------------------------------------
+
+        self.db_status_label = QLabel()
+
+        self.db_status_label.setWordWrap(
+            True
+        )
+
+        root_layout.addWidget(
+            self.db_status_label
+        )
+
+        # ----------------------------------------------------
+        # Operation status
+        # ----------------------------------------------------
+
+        self.status_label = QLabel(
+            "待機中"
+        )
+
+        self.status_label.setWordWrap(
+            True
+        )
+
+        root_layout.addWidget(
+            self.status_label
+        )
+
+        # ----------------------------------------------------
+        # Progress
+        # ----------------------------------------------------
+
+        self.progress_bar = QProgressBar()
+
+        self.progress_bar.setRange(
+            0,
+            100,
+        )
+
+        self.progress_bar.setValue(
+            0
+        )
+
+        root_layout.addWidget(
+            self.progress_bar
+        )
+
+        # ----------------------------------------------------
+        # Bottom buttons
+        # ----------------------------------------------------
+
+        button_layout = QHBoxLayout()
+
+        self.cancel_button = QPushButton(
+            "キャンセル"
+        )
+
+        self.cancel_button.setEnabled(
+            False
+        )
+
+        self.cancel_button.clicked.connect(
+            self._cancel_operation
+        )
+
+        button_layout.addWidget(
+            self.cancel_button
+        )
+
+        button_layout.addStretch()
+
+        self.save_button = QPushButton(
+            "設定保存"
+        )
+
+        self.save_button.clicked.connect(
+            self._save_settings
+        )
+
+        button_layout.addWidget(
+            self.save_button
+        )
+
+        self.full_build_button = QPushButton(
+            "フルビルド"
+        )
+
+        self.full_build_button.clicked.connect(
+            self._start_full_build
+        )
+
+        button_layout.addWidget(
+            self.full_build_button
+        )
+
+        self.close_button = QPushButton(
+            "閉じる"
+        )
+
+        self.close_button.clicked.connect(
+            self.close
+        )
+
+        button_layout.addWidget(
+            self.close_button
+        )
+
+        root_layout.addLayout(
+            button_layout
+        )
+
+    # ========================================================
+    # Initial settings
+    # ========================================================
+
+    def _load_initial_settings(self):
+        try:
+            data = (
+                self.settings_manager.load()
+            )
+
+            stores = data.get(
+                "stores",
+                [],
+            )
+
+            if stores:
+                self.stores = deepcopy(
+                    stores
+                )
+
+                self._recalculate_effective_states()
+                self._populate_tree()
+
+                self.status_label.setText(
+                    "保存済みのフォルダ設定を"
+                    "読み込みました。"
+                )
+
+            else:
+                # --------------------------------------------
+                # 初回起動
+                #
+                # 保存設定が無い場合はOutlookを解析する。
+                # 初回解析ではScannerが決めた
+                # デフォルトON/OFFをそのまま使用する。
+                # --------------------------------------------
+
+                self._start_scan()
+
+        except Exception as exc:
+            log_exception(
+                "Initial settings load failed"
+            )
+
+            QMessageBox.critical(
+                self,
+                "設定読み込みエラー",
+                "builder_settings.json の"
+                "読み込みに失敗しました。\n\n"
+                + str(exc),
+            )
+
+    # ========================================================
+    # Tree helpers
+    # ========================================================
+
+    def _iter_nodes(
+        self,
+        nodes=None,
+    ):
+        if nodes is None:
+            nodes = self.stores
+
+        for node in nodes:
+            yield node
+
+            children = node.get(
+                "children",
+                [],
+            )
+
+            if children:
+                yield from self._iter_nodes(
+                    children
+                )
+
+    def _make_node_key(
+        self,
+        node,
+    ):
+        node_type = node.get(
+            "node_type",
+            "",
+        )
+
+        store_id = str(
+            node.get(
+                "store_id",
+                "",
+            )
+        )
+
+        if node_type == "store":
+            return (
+                "store",
+                store_id,
+            )
+
+        return (
+            "folder",
+            store_id,
+            str(
+                node.get(
+                    "folder_entry_id",
+                    "",
+                )
+            ),
+        )
+
+    def _build_node_map(
+        self,
+        stores,
+    ):
+        result = {}
+
+        def walk(nodes):
+            for node in nodes:
+                result[
+                    self._make_node_key(
+                        node
+                    )
+                ] = node
+
+                walk(
+                    node.get(
+                        "children",
+                        [],
+                    )
+                )
+
+        walk(stores)
+
+        return result
+
+    # ========================================================
+    # Merge scan
+    # ========================================================
+
+    def _merge_scanned_stores(
+        self,
+        scanned_stores,
+    ):
+        # ----------------------------------------------------
+        # 重要:
+        #
+        # 保存済み設定が無い初回解析では、
+        # Scannerのenabledをそのまま使う。
+        #
+        # 以前はここで全ノードをNEW/OFFにしていたため、
+        # 初回解析後に全チェックが外れていた。
+        # ----------------------------------------------------
+
+        if not self.stores:
+            result = deepcopy(
+                scanned_stores
+            )
+
+            for node in self._iter_external_nodes(
+                result
+            ):
+                node["is_new"] = False
+
+            return result
+
+        old_map = (
+            self._build_node_map(
+                self.stores
+            )
+        )
+
+        new_map = (
+            self._build_node_map(
+                scanned_stores
+            )
+        )
+
+        merged = deepcopy(
+            scanned_stores
+        )
+
+        merged_map = (
+            self._build_node_map(
+                merged
+            )
+        )
+
+        # ----------------------------------------------------
+        # Existing / New
+        # ----------------------------------------------------
+
+        for key, node in merged_map.items():
+            old_node = old_map.get(
+                key
+            )
+
+            if old_node is not None:
+                # 保存済みの自分自身のチェック状態を保持
+                node["enabled"] = bool(
+                    old_node.get(
+                        "enabled",
+                        False,
+                    )
+                )
+
+                node["is_new"] = False
+
+            else:
+                # --------------------------------------------
+                # 再解析で新しく見つかったノード
+                #
+                # 新規フォルダを勝手に検索対象へ
+                # 入れないためOFF。
+                # --------------------------------------------
+
+                node["enabled"] = False
+                node["is_new"] = True
+
+        # ----------------------------------------------------
+        # Missing nodes
+        #
+        # 保存済みだが今回Outlook側で見つからなかったもの。
+        # ----------------------------------------------------
+
+        for key, old_node in old_map.items():
+            if key in new_map:
+                continue
+
+            missing = deepcopy(
+                old_node
+            )
+
+            missing["available"] = False
+            missing["effective_enabled"] = False
+            missing["is_new"] = False
+
+            parent_id = str(
+                missing.get(
+                    "parent_folder_entry_id",
+                    "",
+                )
+            )
+
+            store_id = str(
+                missing.get(
+                    "store_id",
+                    "",
+                )
+            )
+
+            if (
+                missing.get(
+                    "node_type"
+                )
+                == "store"
+            ):
+                merged.append(
+                    missing
+                )
+
+                continue
+
+            parent = self._find_parent_node(
+                merged,
+                store_id,
+                parent_id,
+            )
+
+            if parent is not None:
+                parent.setdefault(
+                    "children",
+                    [],
+                ).append(
+                    missing
+                )
+
+        return merged
+
+    def _iter_external_nodes(
+        self,
+        stores,
+    ):
+        for node in stores:
+            yield node
+
+            children = node.get(
+                "children",
+                [],
+            )
+
+            if children:
+                yield from self._iter_external_nodes(
+                    children
+                )
+
+    def _find_parent_node(
+        self,
+        stores,
+        store_id,
+        parent_folder_entry_id,
+    ):
+        if not parent_folder_entry_id:
+            for store in stores:
+                if (
+                    str(
+                        store.get(
+                            "store_id",
+                            "",
+                        )
+                    )
+                    == store_id
+                ):
+                    return store
+
+            return None
+
+        for node in self._iter_external_nodes(
+            stores
+        ):
+            if (
+                str(
+                    node.get(
+                        "store_id",
+                        "",
+                    )
+                )
+                == store_id
+                and
+                str(
+                    node.get(
+                        "folder_entry_id",
+                        "",
+                    )
+                )
+                == parent_folder_entry_id
+            ):
+                return node
+
+        return None
+
+    # ========================================================
+    # Effective states
+    # ========================================================
+
+    def _recalculate_effective_states(
+        self,
+    ):
+        def walk(
+            nodes,
+            parent_effective=True,
+        ):
+            for node in nodes:
+                own_enabled = bool(
+                    node.get(
+                        "enabled",
+                        False,
+                    )
+                )
+
+                available = bool(
+                    node.get(
+                        "available",
+                        True,
+                    )
+                )
+
+                hard_disabled = bool(
+                    node.get(
+                        "hard_disabled",
+                        False,
+                    )
+                )
+
+                effective = (
+                    parent_effective
+                    and own_enabled
+                    and available
+                    and not hard_disabled
+                )
+
+                node[
+                    "effective_enabled"
+                ] = effective
+
+                walk(
+                    node.get(
+                        "children",
+                        [],
+                    ),
+                    effective,
+                )
+
+        walk(
+            self.stores,
+            True,
+        )
+
+    # ========================================================
+    # Populate tree
+    # ========================================================
+
+    def _populate_tree(self):
+        self._updating_tree = True
+
+        try:
+            self.tree.clear()
+
+            for store in self.stores:
+                item = (
+                    self._create_tree_item(
+                        store
+                    )
+                )
+
+                self.tree.addTopLevelItem(
+                    item
+                )
+
+                self._add_children_to_tree(
+                    item,
+                    store.get(
+                        "children",
+                        [],
+                    ),
+                )
+
+                item.setExpanded(
+                    True
+                )
+
+            self._apply_tree_effective_visuals()
+
+        finally:
+            self._updating_tree = False
+
+    def _add_children_to_tree(
+        self,
+        parent_item,
+        children,
+    ):
+        for node in children:
+            item = (
+                self._create_tree_item(
+                    node
+                )
+            )
+
+            parent_item.addChild(
+                item
+            )
+
+            self._add_children_to_tree(
+                item,
+                node.get(
+                    "children",
+                    [],
+                ),
+            )
+
+    def _create_tree_item(
+        self,
+        node,
+    ):
+        item = QTreeWidgetItem()
+
+        item.setText(
+            0,
+            str(
+                node.get(
+                    "display_name",
+                    "",
+                )
+            ),
+        )
+
+        item.setData(
+            0,
+            ROLE_NODE,
+            node,
+        )
+
+        item.setData(
+            0,
+            ROLE_STORE_ID,
+            str(
+                node.get(
+                    "store_id",
+                    "",
+                )
+            ),
+        )
+
+        item.setData(
+            0,
+            ROLE_FOLDER_ID,
+            str(
+                node.get(
+                    "folder_entry_id",
+                    "",
+                )
+            ),
+        )
+
+        flags = item.flags()
+
+        flags |= (
+            Qt.ItemIsUserCheckable
+        )
+
+        item.setFlags(
+            flags
+        )
+
+        if node.get(
+            "hard_disabled",
+            False,
+        ):
+            item.setCheckState(
+                0,
+                Qt.Unchecked,
+            )
+
+        else:
+            item.setCheckState(
+                0,
+                (
+                    Qt.Checked
+                    if node.get(
+                        "enabled",
+                        False,
+                    )
+                    else Qt.Unchecked
+                ),
+            )
+
+        return item
+
+    # ========================================================
+    # Tree changed
+    # ========================================================
+
+    def _on_tree_item_changed(
+        self,
+        item,
+        column,
+    ):
+        if self._updating_tree:
+            return
+
+        if column != 0:
+            return
+
+        node = item.data(
+            0,
+            ROLE_NODE,
+        )
+
+        if not isinstance(
+            node,
+            dict,
+        ):
+            return
+
+        if node.get(
+            "hard_disabled",
+            False,
+        ):
+            self._updating_tree = True
+
+            try:
+                item.setCheckState(
+                    0,
+                    Qt.Unchecked,
+                )
+
+            finally:
+                self._updating_tree = False
+
+            return
+
+        # ----------------------------------------------------
+        # UIのチェック状態をその場でモデルへ反映
+        #
+        # これが無いと、チェックを変更しても
+        # self.stores側が古い状態のままになり、
+        # 保存時にOFFへ戻る場合があった。
+        # ----------------------------------------------------
+
+        node["enabled"] = (
+            item.checkState(0)
+            == Qt.Checked
+        )
+
+        self._recalculate_effective_states()
+
+        self._updating_tree = True
+
+        try:
+            self._apply_tree_effective_visuals()
+
+        finally:
+            self._updating_tree = False
+
+        self._set_dirty(
+            True
+        )
+
+    # ========================================================
+    # Apply tree visual state
+    # ========================================================
+
+    def _apply_tree_effective_visuals(
+        self,
+    ):
+        root = (
+            self.tree.invisibleRootItem()
+        )
+
+        for i in range(
+            root.childCount()
+        ):
+            self._apply_item_visual(
+                root.child(i),
+                parent_effective=True,
+            )
+
+    def _apply_item_visual(
+        self,
+        item,
+        parent_effective,
+    ):
+        node = item.data(
+            0,
+            ROLE_NODE,
+        )
+
+        if not isinstance(
+            node,
+            dict,
+        ):
+            return
+
+        available = bool(
+            node.get(
+                "available",
+                True,
+            )
+        )
+
+        hard_disabled = bool(
+            node.get(
+                "hard_disabled",
+                False,
+            )
+        )
+
+        own_enabled = bool(
+            node.get(
+                "enabled",
+                False,
+            )
+        )
+
+        # ----------------------------------------------------
+        # 自分のチェック操作が可能か
+        #
+        # 親がOFFなら子は一時的に操作不可。
+        # ただし子自身のチェック状態は保持する。
+        # ----------------------------------------------------
+
+        can_operate = (
+            parent_effective
+            and available
+            and not hard_disabled
+        )
+
+        flags = item.flags()
+
+        if can_operate:
+            flags |= Qt.ItemIsEnabled
+        else:
+            flags &= ~Qt.ItemIsEnabled
+
+        item.setFlags(
+            flags
+        )
+
+        # ----------------------------------------------------
+        # チェック表示
+        #
+        # 親OFFでも子自身のチェック状態を消さない。
+        # ----------------------------------------------------
+
+        if hard_disabled:
+            item.setCheckState(
+                0,
+                Qt.Unchecked,
+            )
+
+        else:
+            item.setCheckState(
+                0,
+                (
+                    Qt.Checked
+                    if own_enabled
+                    else Qt.Unchecked
+                ),
+            )
+
+        # ----------------------------------------------------
+        # Status
+        # ----------------------------------------------------
+
+        status = []
+
+        if node.get(
+            "is_new",
+            False,
+        ):
+            status.append(
+                "NEW"
+            )
+
+        if not available:
+            status.append(
+                "利用不可"
+            )
+
+        if hard_disabled:
+            status.append(
+                "除外固定"
+            )
+
+        item.setText(
+            1,
+            " / ".join(
+                status
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Gray ineffective nodes
+        # ----------------------------------------------------
+
+        if can_operate:
+            brush = QBrush(
+                QColor(
+                    "#000000"
+                )
+            )
+
+        else:
+            brush = QBrush(
+                QColor(
+                    "#888888"
+                )
+            )
+
+        item.setForeground(
+            0,
+            brush,
+        )
+
+        item.setForeground(
+            1,
+            brush,
+        )
+
+        effective = (
+            parent_effective
+            and own_enabled
+            and available
+            and not hard_disabled
+        )
+
+        for i in range(
+            item.childCount()
+        ):
+            self._apply_item_visual(
+                item.child(i),
+                effective,
+            )
+
+    # ========================================================
+    # Tree → Model
+    # ========================================================
+
+    def _sync_tree_checks_to_model(
+        self,
+    ):
+        """
+        保存直前にQTreeWidgetの状態を
+        self.storesへ明示的に同期する。
+
+        itemChangedだけに依存しないため、
+        保存時にチェック状態が戻る問題を防ぐ。
+        """
+
+        root = (
+            self.tree.invisibleRootItem()
+        )
+
+        for i in range(
+            root.childCount()
+        ):
+            self._sync_tree_item_to_model(
+                root.child(i)
+            )
+
+        self._recalculate_effective_states()
+
+    def _sync_tree_item_to_model(
+        self,
+        item,
+    ):
+        node = item.data(
+            0,
+            ROLE_NODE,
+        )
+
+        if isinstance(
+            node,
+            dict,
+        ):
+            if node.get(
+                "hard_disabled",
+                False,
+            ):
+                node["enabled"] = False
+
+            else:
+                node["enabled"] = (
+                    item.checkState(0)
+                    == Qt.Checked
+                )
+
+        for i in range(
+            item.childCount()
+        ):
+            self._sync_tree_item_to_model(
+                item.child(i)
+            )
+
+    # ========================================================
+    # Dirty
+    # ========================================================
+
+    def _set_dirty(
+        self,
+        dirty,
+    ):
+        self.dirty = bool(
+            dirty
+        )
+
+        title = (
+            "Outlook DB Builder - 設定"
+        )
+
+        if self.dirty:
+            title += " *"
+
+        self.setWindowTitle(
+            title
+        )
+
+    # ========================================================
+    # Scan
+    # ========================================================
+
+    def _start_scan(self):
+        if self.operation_type:
+            return
+
+        self.operation_type = (
+            "scan"
+        )
+
+        self.status_label.setText(
+            "Outlookフォルダを"
+            "解析しています..."
+        )
+
+        self.progress_bar.setRange(
+            0,
+            0,
+        )
+
+        self._set_operation_ui(
+            True
+        )
+
+        self.scan_thread = (
+            QThread(self)
+        )
+
+        self.scan_worker = (
+            ScanWorker()
+        )
+
+        self.scan_worker.moveToThread(
+            self.scan_thread
+        )
+
+        self.scan_thread.started.connect(
+            self.scan_worker.run
+        )
+
+        self.scan_worker.progress.connect(
+            self._on_scan_progress
+        )
+
+        self.scan_worker.finished.connect(
+            self._on_scan_finished
+        )
+
+        self.scan_worker.failed.connect(
+            self._on_scan_failed
+        )
+
+        self.scan_worker.cancelled.connect(
+            self._on_scan_cancelled
+        )
+
+        self.scan_worker.finished.connect(
+            self.scan_thread.quit
+        )
+
+        self.scan_worker.failed.connect(
+            self.scan_thread.quit
+        )
+
+        self.scan_worker.cancelled.connect(
+            self.scan_thread.quit
+        )
+
+        self.scan_thread.finished.connect(
+            self._on_scan_thread_finished
+        )
+
+        self.scan_thread.start()
+
+    def _on_scan_progress(
+        self,
+        data,
+    ):
+        if not isinstance(
+            data,
+            dict,
+        ):
+            return
+
+        message = data.get(
+            "message"
+        )
+
+        if message:
+            self.status_label.setText(
+                str(message)
+            )
+
+    def _on_scan_finished(
+        self,
+        scanned_stores,
+    ):
+        self.stores = (
+            self._merge_scanned_stores(
+                scanned_stores
+            )
+        )
+
+        self._recalculate_effective_states()
+        self._populate_tree()
+
+        self._set_dirty(
+            True
+        )
+
+        self.status_label.setText(
+            "Outlookフォルダの"
+            "解析が完了しました。\n"
+            "内容を確認して"
+            "「設定保存」を押してください。"
+        )
+
+    def _on_scan_failed(
+        self,
+        error_text,
+    ):
+        QMessageBox.critical(
+            self,
+            "Outlook解析エラー",
+            "Outlookフォルダの"
+            "解析に失敗しました。\n\n"
+            + str(error_text),
+        )
+
+        self.status_label.setText(
+            "Outlookフォルダの"
+            "解析に失敗しました。"
+        )
+
+    def _on_scan_cancelled(self):
+        self.status_label.setText(
+            "Outlookフォルダの"
+            "解析をキャンセルしました。"
+        )
+
+    def _on_scan_thread_finished(
+        self,
+    ):
+        self.operation_type = None
+
+        self.scan_worker = None
+        self.scan_thread = None
+
+        self.progress_bar.setRange(
+            0,
+            100,
+        )
+
+        self.progress_bar.setValue(
+            0
+        )
+
+        self._set_operation_ui(
+            False
+        )
+
+        self._finish_close_if_requested()
+
+    # ========================================================
+    # Save
+    # ========================================================
+
+    def _save_settings(
+        self,
+    ):
+        try:
+            # -----------------------------------------------
+            # 重要:
+            # UIの現在チェック状態を保存データへ同期
+            # -----------------------------------------------
+
+            self._sync_tree_checks_to_model()
+
+            # -----------------------------------------------
+            # NEW表示は保存後に解除
+            # -----------------------------------------------
+
+            for node in self._iter_nodes():
+                node["is_new"] = False
+
+            self.settings_manager.save(
+                self.stores
+            )
+
+            # -----------------------------------------------
+            # 既存DBがあれば有効フォルダ設定も同期
+            # -----------------------------------------------
+
+            try:
+                self.db_manager.sync_folder_settings(
+                    self.stores
+                )
+            except Exception:
+                log_exception(
+                    "Database folder settings sync failed"
+                )
+
+            self._populate_tree()
+
+            self._set_dirty(
+                False
+            )
+
+            self.status_label.setText(
+                "設定を保存しました。"
+            )
+
+            log_info(
+                "Builder settings saved"
+            )
+
+        except Exception as exc:
+            log_exception(
+                "Builder settings save failed"
+            )
+
+            QMessageBox.critical(
+                self,
+                "設定保存エラー",
+                "設定の保存に"
+                "失敗しました。\n\n"
+                + str(exc),
+            )
+
+    # ========================================================
+    # Full build
+    # ========================================================
+
+    def _start_full_build(
+        self,
+    ):
+        if self.operation_type:
+            return
+
+        # ----------------------------------------------------
+        # UI → Model
+        # ----------------------------------------------------
+
+        self._sync_tree_checks_to_model()
+
+        # ----------------------------------------------------
+        # 未保存なら先に保存
+        # ----------------------------------------------------
+
+        if self.dirty:
+            answer = QMessageBox.question(
+                self,
+                "設定保存",
+                "フォルダ設定が"
+                "変更されています。\n\n"
+                "現在の設定を保存してから"
+                "フルビルドを開始しますか？",
+                QMessageBox.Yes
+                | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+
+            if answer != QMessageBox.Yes:
+                return
+
+            self._save_settings()
+
+            if self.dirty:
+                return
+
+        active_folders = (
+            self.db_manager
+            .get_active_folders_from_settings(
+                self.stores
+            )
+        )
+
+        if not active_folders:
+            QMessageBox.warning(
+                self,
+                "フルビルド",
+                "検索対象として有効な"
+                "フォルダがありません。",
+            )
+
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "フルビルド",
+            "検索DBを"
+            "フルビルドします。\n\n"
+            f"対象フォルダ: "
+            f"{len(active_folders):,}\n\n"
+            "既存のmail.dbは"
+            "新しいDBの作成・検証が"
+            "完了するまで保持されます。\n\n"
+            "開始しますか？",
+            QMessageBox.Yes
+            | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if answer != QMessageBox.Yes:
+            return
+
+        self.operation_type = (
+            "build"
+        )
+
+        self._build_result = None
+        self._build_error = None
+        self._build_was_cancelled = False
+
+        self.progress_bar.setRange(
+            0,
+            100,
+        )
+
+        self.progress_bar.setValue(
+            0
+        )
+
+        self.status_label.setText(
+            "フルビルドを"
+            "開始しています..."
+        )
+
+        self._set_operation_ui(
+            True
+        )
+
+        self.build_thread = (
+            QThread(self)
+        )
+
+        self.build_worker = (
+            FullBuildWorker(
+                db_manager=self.db_manager,
+                folders=active_folders,
+            )
+        )
+
+        self.build_worker.moveToThread(
+            self.build_thread
+        )
+
+        self.build_thread.started.connect(
+            self.build_worker.run
+        )
+
+        self.build_worker.progress.connect(
+            self._on_build_progress
+        )
+
+        self.build_worker.finished.connect(
+            self._on_build_success
+        )
+
+        self.build_worker.failed.connect(
+            self._on_build_failed
+        )
+
+        self.build_worker.cancelled.connect(
+            self._on_build_cancelled
+        )
+
+        self.build_worker.finished.connect(
+            self.build_thread.quit
+        )
+
+        self.build_worker.failed.connect(
+            self.build_thread.quit
+        )
+
+        self.build_worker.cancelled.connect(
+            self.build_thread.quit
+        )
+
+        self.build_thread.finished.connect(
+            self._on_build_thread_finished
+        )
+
+        self.build_thread.start()
+
+    # ========================================================
+    # Build progress
+    # ========================================================
+
+    def _on_build_progress(
+        self,
+        data,
+    ):
+        if not isinstance(
+            data,
+            dict,
+        ):
+            return
+
+        event_type = str(
+            data.get(
+                "type",
+                "",
+            )
+        )
+
+        inserted = int(
+            data.get(
+                "inserted",
+                0,
+            )
+            or 0
+        )
+
+        skipped = int(
+            data.get(
+                "skipped",
+                0,
+            )
+            or 0
+        )
+
+        warnings = int(
+            data.get(
+                "warnings",
+                data.get(
+                    "warning_count",
+                    0,
+                ),
+            )
+            or 0
+        )
+
+        # ----------------------------------------------------
+        # Folder start
+        # ----------------------------------------------------
+
+        if event_type == "folder_start":
+            folder_number = int(
+                data.get(
+                    "folder_number",
+                    0,
+                )
+                or 0
+            )
+
+            folder_total = int(
+                data.get(
+                    "folder_total",
+                    0,
+                )
+                or 0
+            )
+
+            folder_path = str(
+                data.get(
+                    "folder_path",
+                    "",
+                )
+            )
+
+            if folder_total > 0:
+                percent = int(
+                    (
+                        max(
+                            folder_number - 1,
+                            0,
+                        )
+                        / folder_total
+                    )
+                    * 98
+                )
+
+                self.progress_bar.setValue(
+                    min(
+                        percent,
+                        98,
+                    )
+                )
+
+            self.status_label.setText(
+                "フルビルド中\n\n"
+                f"フォルダ: "
+                f"{folder_number:,}"
+                f" / "
+                f"{folder_total:,}\n"
+                f"{folder_path}\n\n"
+                f"DB登録: "
+                f"{inserted:,}\n"
+                f"スキップ: "
+                f"{skipped:,}\n"
+                f"取得警告: "
+                f"{warnings:,}"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Mail progress
+        # ----------------------------------------------------
+
+        if event_type == "mail_progress":
+            folder_number = int(
+                data.get(
+                    "folder_number",
+                    0,
+                )
+                or 0
+            )
+
+            folder_total = int(
+                data.get(
+                    "folder_total",
+                    0,
+                )
+                or 0
+            )
+
+            item_number = int(
+                data.get(
+                    "item_number",
+                    0,
+                )
+                or 0
+            )
+
+            item_total = int(
+                data.get(
+                    "item_total",
+                    0,
+                )
+                or 0
+            )
+
+            folder_path = str(
+                data.get(
+                    "folder_path",
+                    "",
+                )
+            )
+
+            if folder_total > 0:
+                folder_fraction = 0.0
+
+                if item_total > 0:
+                    folder_fraction = min(
+                        item_number
+                        / item_total,
+                        1.0,
+                    )
+
+                overall = (
+                    (
+                        max(
+                            folder_number - 1,
+                            0,
+                        )
+                        + folder_fraction
+                    )
+                    / folder_total
+                )
+
+                self.progress_bar.setValue(
+                    min(
+                        int(
+                            overall
+                            * 98
+                        ),
+                        98,
+                    )
+                )
+
+            self.status_label.setText(
+                "フルビルド中\n\n"
+                f"フォルダ: "
+                f"{folder_number:,}"
+                f" / "
+                f"{folder_total:,}\n"
+                f"{folder_path}\n\n"
+                f"処理: "
+                f"{item_number:,}"
+                f" / "
+                f"{item_total:,}\n"
+                f"DB登録: "
+                f"{inserted:,}\n"
+                f"スキップ: "
+                f"{skipped:,}\n"
+                f"取得警告: "
+                f"{warnings:,}"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Field warning
+        # ----------------------------------------------------
+
+        if event_type == "field_warning":
+            return
+
+        # ----------------------------------------------------
+        # Folder complete
+        # ----------------------------------------------------
+
+        if event_type == "folder_complete":
+            folder_number = int(
+                data.get(
+                    "folder_number",
+                    0,
+                )
+                or 0
+            )
+
+            folder_total = int(
+                data.get(
+                    "folder_total",
+                    0,
+                )
+                or 0
+            )
+
+            folder_inserted = int(
+                data.get(
+                    "folder_inserted",
+                    0,
+                )
+                or 0
+            )
+
+            folder_skipped = int(
+                data.get(
+                    "folder_skipped",
+                    0,
+                )
+                or 0
+            )
+
+            if folder_total > 0:
+                self.progress_bar.setValue(
+                    min(
+                        int(
+                            (
+                                folder_number
+                                / folder_total
+                            )
+                            * 98
+                        ),
+                        98,
+                    )
+                )
+
+            self.status_label.setText(
+                "フォルダ処理完了\n\n"
+                f"フォルダ: "
+                f"{folder_number:,}"
+                f" / "
+                f"{folder_total:,}\n\n"
+                f"このフォルダの登録: "
+                f"{folder_inserted:,}\n"
+                f"このフォルダのスキップ: "
+                f"{folder_skipped:,}\n\n"
+                f"DB登録合計: "
+                f"{inserted:,}\n"
+                f"スキップ合計: "
+                f"{skipped:,}\n"
+                f"取得警告: "
+                f"{warnings:,}"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Folder error
+        # ----------------------------------------------------
+
+        if event_type == "folder_error":
+            folder_number = int(
+                data.get(
+                    "folder_number",
+                    0,
+                )
+                or 0
+            )
+
+            folder_total = int(
+                data.get(
+                    "folder_total",
+                    0,
+                )
+                or 0
+            )
+
+            self.status_label.setText(
+                "フォルダの読み込みで"
+                "エラーが発生しました。\n"
+                "このフォルダをスキップして"
+                "続行します。\n\n"
+                f"フォルダ: "
+                f"{folder_number:,}"
+                f" / "
+                f"{folder_total:,}\n\n"
+                f"DB登録: "
+                f"{inserted:,}\n"
+                f"スキップ: "
+                f"{skipped:,}\n"
+                f"取得警告: "
+                f"{warnings:,}\n\n"
+                "詳細は "
+                "OutlookDBBuilder.log "
+                "を確認してください。"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Finalizing
+        # ----------------------------------------------------
+
+        if event_type == "finalizing":
+            self.progress_bar.setValue(
+                98
+            )
+
+            self.status_label.setText(
+                "メールの読み込みが"
+                "完了しました。\n\n"
+                "検索インデックスと"
+                "FTS5 trigramを"
+                "作成しています...\n\n"
+                f"DB登録: "
+                f"{inserted:,}\n"
+                f"スキップ: "
+                f"{skipped:,}\n"
+                f"取得警告: "
+                f"{warnings:,}"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Validate
+        # ----------------------------------------------------
+
+        if event_type == "validating":
+            self.progress_bar.setValue(
+                99
+            )
+
+            self.status_label.setText(
+                "新しい検索DBを"
+                "検証しています..."
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Swap
+        # ----------------------------------------------------
+
+        if event_type == "swapping":
+            self.progress_bar.setValue(
+                99
+            )
+
+            self.status_label.setText(
+                "新しい検索DBへ"
+                "切り替えています..."
+            )
+
+            return
+
+    # ========================================================
+    # Build signals
+    # ========================================================
+
+    def _on_build_success(
+        self,
+        result,
+    ):
+        self._build_result = result
+
+    def _on_build_failed(
+        self,
+        error_text,
+    ):
+        self._build_error = (
+            error_text
+        )
+
+    def _on_build_cancelled(
+        self,
+    ):
+        self._build_was_cancelled = True
+
+    # ========================================================
+    # Build thread finished
+    # ========================================================
+
+    def _on_build_thread_finished(
+        self,
+    ):
+        result = self._build_result
+        error_text = self._build_error
+        was_cancelled = (
+            self._build_was_cancelled
+        )
+
+        self.operation_type = None
+
+        self.build_worker = None
+        self.build_thread = None
+
+        self._build_result = None
+        self._build_error = None
+        self._build_was_cancelled = False
+
+        self._set_operation_ui(
+            False
+        )
+
+        self._refresh_db_status()
+
+        # ----------------------------------------------------
+        # Cancel
+        # ----------------------------------------------------
+
+        if was_cancelled:
+            self.status_label.setText(
+                "フルビルドを"
+                "キャンセルしました。\n\n"
+                "既存のmail.dbは"
+                "変更されていません。"
+            )
+
+            QMessageBox.information(
+                self,
+                "フルビルド",
+                "フルビルドを"
+                "キャンセルしました。\n\n"
+                "既存の検索DBは"
+                "そのまま使用できます。",
+            )
+
+            self._finish_close_if_requested()
+            return
+
+        # ----------------------------------------------------
+        # Error
+        # ----------------------------------------------------
+
+        if error_text:
+            self.status_label.setText(
+                "フルビルドに"
+                "失敗しました。\n\n"
+                "OutlookDBBuilder.log を"
+                "確認してください。"
+            )
+
+            QMessageBox.critical(
+                self,
+                "フルビルドエラー",
+                "フルビルドに"
+                "失敗しました。\n\n"
+                "詳細は "
+                "OutlookDBBuilder.log を"
+                "確認してください。\n\n"
+                + str(
+                    error_text
+                )[-2000:],
+            )
+
+            self._finish_close_if_requested()
+            return
+
+        if result is None:
+            QMessageBox.warning(
+                self,
+                "フルビルド",
+                "フルビルドの結果を"
+                "取得できませんでした。",
+            )
+
+            self._finish_close_if_requested()
+            return
+
+        # ----------------------------------------------------
+        # Result
+        # ----------------------------------------------------
+
+        mail_count = int(
+            result.get(
+                "mail_count",
+                0,
+            )
+            or 0
+        )
+
+        skipped_count = int(
+            result.get(
+                "skipped_count",
+                0,
+            )
+            or 0
+        )
+
+        warning_count = int(
+            result.get(
+                "warning_count",
+                0,
+            )
+            or 0
+        )
+
+        success_count = int(
+            result.get(
+                "folder_success_count",
+                0,
+            )
+            or 0
+        )
+
+        folder_error_count = int(
+            result.get(
+                "folder_error_count",
+                0,
+            )
+            or 0
+        )
+
+        self.progress_bar.setRange(
+            0,
+            100,
+        )
+
+        self.progress_bar.setValue(
+            100
+        )
+
+        result_text = (
+            f"登録メール: "
+            f"{mail_count:,}\n"
+            f"スキップ: "
+            f"{skipped_count:,}\n"
+            f"取得警告: "
+            f"{warning_count:,}\n\n"
+            f"成功フォルダ: "
+            f"{success_count:,}\n"
+            f"エラーフォルダ: "
+            f"{folder_error_count:,}"
+        )
+
+        if (
+            skipped_count == 0
+            and warning_count == 0
+            and folder_error_count == 0
+        ):
+            self.status_label.setText(
+                "フルビルドが"
+                "正常に完了しました。\n\n"
+                + result_text
+            )
+
+            QMessageBox.information(
+                self,
+                "フルビルド完了",
+                "検索DBの作成が"
+                "正常に完了しました。\n\n"
+                + result_text,
+            )
+
+        else:
+            self.status_label.setText(
+                "フルビルドが"
+                "完了しました。\n\n"
+                + result_text
+            )
+
+            QMessageBox.warning(
+                self,
+                "フルビルド完了",
+                "検索DBの作成は"
+                "完了しました。\n\n"
+                + result_text
+                + "\n\n"
+                "詳細は "
+                "OutlookDBBuilder.log を"
+                "確認してください。",
+            )
+
+        self._refresh_db_status()
+        self._finish_close_if_requested()
+
+    # ========================================================
+    # Cancel
+    # ========================================================
+
+    def _cancel_operation(
+        self,
+    ):
+        if (
+            self.operation_type
+            == "scan"
+            and self.scan_worker
+        ):
+            self.status_label.setText(
+                "Outlook解析を"
+                "キャンセルしています..."
+            )
+
+            self.scan_worker.cancel()
+
+        elif (
+            self.operation_type
+            == "build"
+            and self.build_worker
+        ):
+            self.status_label.setText(
+                "フルビルドを"
+                "キャンセルしています..."
+            )
+
+            self.build_worker.cancel()
+
+    # ========================================================
+    # Operation UI
+    # ========================================================
+
+    def _set_operation_ui(
+        self,
+        running,
+    ):
+        self.rescan_button.setEnabled(
+            not running
+        )
+
+        self.save_button.setEnabled(
+            not running
+        )
+
+        self.full_build_button.setEnabled(
+            not running
+        )
+
+        self.tree.setEnabled(
+            not running
+        )
+
+        self.cancel_button.setEnabled(
+            running
+        )
+
+    # ========================================================
+    # DB status
+    # ========================================================
+
+    def _refresh_db_status(
+        self,
+    ):
+        try:
+            status = (
+                self.db_manager
+                .get_status()
+            )
+
+            if not status.get(
+                "exists",
+                False,
+            ):
+                self.db_status_label.setText(
+                    "検索DB: 未作成"
+                )
+
+                return
+
+            mail_count = int(
+                status.get(
+                    "mail_count",
+                    0,
+                )
+                or 0
+            )
+
+            revision = status.get(
+                "revision",
+                "",
+            )
+
+            updated = status.get(
+                "last_updated_at",
+                "",
+            )
+
+            text = (
+                "検索DB: "
+                f"{mail_count:,}通"
+            )
+
+            if revision != "":
+                text += (
+                    f" / revision "
+                    f"{revision}"
+                )
+
+            if updated:
+                text += (
+                    f" / 更新 "
+                    f"{updated}"
+                )
+
+            self.db_status_label.setText(
+                text
+            )
+
+        except Exception:
+            self.db_status_label.setText(
+                "検索DB: 状態取得エラー"
+            )
+
+    # ========================================================
+    # Close
+    # ========================================================
+
+    def closeEvent(
+        self,
+        event: QCloseEvent,
+    ):
+        if self.operation_type:
+            answer = QMessageBox.question(
+                self,
+                "終了確認",
+                "現在処理中です。\n\n"
+                "処理をキャンセルして"
+                "終了しますか？",
+                QMessageBox.Yes
+                | QMessageBox.No,
+                QMessageBox.No,
+            )
+
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+
+            self._close_requested = True
+
+            self._cancel_operation()
+
+            event.ignore()
+            return
+
+        if self.dirty:
+            answer = QMessageBox.question(
+                self,
+                "未保存の設定",
+                "保存していない"
+                "フォルダ設定があります。\n\n"
+                "変更を破棄して"
+                "終了しますか？",
+                QMessageBox.Yes
+                | QMessageBox.No,
+                QMessageBox.No,
+            )
+
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+
+        event.accept()
+
+    def _finish_close_if_requested(
+        self,
+    ):
+        if not self._close_requested:
+            return
+
+        if self.operation_type:
+            return
+
+        self._close_requested = False
+
+        self._set_dirty(
+            False
+        )
+
+        self.close()
